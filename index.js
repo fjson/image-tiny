@@ -1,79 +1,69 @@
 /**
- * 使用 @squoosh/lib 批量压缩图片并裁剪
- * 
- * 安装依赖：npm install @squoosh/lib
+ * 使用 sharp 裁剪图片（保留中间338像素宽度）并使用 @squoosh/lib 压缩
+ * * 安装依赖：npm install @squoosh/lib sharp
  * 使用方法：node compress-images.js
  */
 
 const fs = require('fs');
 const path = require('path');
 const { ImagePool } = require('@squoosh/lib');
+const sharp = require('sharp');
 
 // ========== 配置区域 ==========
 const CONFIG = {
   inputDir: './jump',           // 输入文件夹路径
-  outputDir: './jumpCompress',      // 输出文件夹路径
+  outputDir: './jumpCompress',  // 输出文件夹路径
+  
+  // 裁剪设置
+  crop: {
+    enabled: true,
+    width: 1305,                 // 裁剪到338像素宽度
+  },
   
   // 压缩设置
   encodeOptions: {
-    // 使用 OxiPNG 压缩 PNG
     oxipng: {
-      level: 2,                   // 压缩级别 0-6
+      level: 2,
     },
-    // 或使用 MozJPEG 压缩 JPEG
     mozjpeg: {
-      quality: 80,                // 质量 0-100
+      quality: 80,
       progressive: true,
     },
-    // 或使用 WebP
     webp: {
       quality: 80,
-      method: 4,                  // 压缩方法 0-6
+      method: 4,
     }
   },
   
-  // 预处理选项
+  // 预处理选项（仅用于 @squoosh/lib）
   preprocessOptions: {
-    // 调整大小
+    // 调整大小（可选）
     resize: {
       enabled: true,
-      width: 338,                 // 修改为338
+      width: 338,
       height: 280,
     },
-    // 缩减调色板（Reduce palette）- 关键压缩选项！
+    // 缩减调色板
     quant: {
-      enabled: true,              // 是否启用调色板缩减
-      numColors: 128,             // 颜色数量 2-256
-      dither: 1.0,                // 抖动强度 0-1
+      enabled: true,
+      numColors: 64,
+      dither: 1.0,
     }
-  },
-  
-  // 裁剪设置 - 新增
-  cropOptions: {
-    enabled: true,                // 是否启用裁剪
-    width: 338,                   // 裁剪宽度
-    keepHeight: true,             // 保持原始高度
   },
   
   formats: ['.jpg', '.jpeg', '.png'], // 支持的输入格式
-  outputFormat: null,              // 输出格式，null表示保持原格式
-  maxConcurrent: 4,                // 最大并发数
+  outputFormat: null,                 // 输出格式，null表示保持原格式
+  maxConcurrent: 4,                   // 最大并发数
 };
 
 // ========== 工具函数 ==========
 
-/**
- * 确保目录存在
- */
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }
 
-/**
- * 格式化文件大小
- */
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
   const k = 1024;
@@ -82,9 +72,6 @@ function formatBytes(bytes) {
   return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i];
 }
 
-/**
- * 获取所有图片文件
- */
 function getImageFiles(dir) {
   const files = [];
   
@@ -110,9 +97,6 @@ function getImageFiles(dir) {
   return files;
 }
 
-/**
- * 获取编码器类型
- */
 function getEncoder(filePath, customFormat) {
   const ext = (customFormat || path.extname(filePath)).toLowerCase();
   
@@ -129,9 +113,6 @@ function getEncoder(filePath, customFormat) {
   }
 }
 
-/**
- * 获取输出路径
- */
 function getOutputPath(inputPath, customFormat) {
   const relativePath = path.relative(CONFIG.inputDir, inputPath);
   const parsed = path.parse(relativePath);
@@ -142,6 +123,33 @@ function getOutputPath(inputPath, customFormat) {
   }
   
   return path.join(CONFIG.outputDir, parsed.dir, parsed.base);
+}
+
+/**
+ * 使用 sharp 裁剪图片
+ */
+async function cropImage(inputBuffer) {
+  try {
+    const image = sharp(inputBuffer);
+    const metadata = await image.metadata();
+    
+    if (!metadata.width || metadata.width <= CONFIG.crop.width) {
+      return inputBuffer; // 如果图片宽度小于或等于338像素，直接返回原缓冲区
+    }
+    
+    const xOffset = Math.floor((metadata.width - CONFIG.crop.width) / 2);
+    
+    return await image
+      .extract({
+        left: xOffset,
+        top: 0,
+        width: CONFIG.crop.width,
+        height: metadata.height
+      })
+      .toBuffer();
+  } catch (error) {
+    throw new Error(`裁剪失败: ${error.message}`);
+  }
 }
 
 /**
@@ -156,10 +164,11 @@ async function compressImages(imageFiles) {
     totalOutputSize: 0,
   };
   
-  console.log(`开始压缩 ${imageFiles.length} 个图片...\n`);
+  console.log(`开始处理 ${imageFiles.length} 个图片...\n`);
   
+  const imagePool = new ImagePool(CONFIG.maxConcurrent);
+
   for (let i = 0; i < imageFiles.length; i++) {
-    const imagePool = new ImagePool(CONFIG.maxConcurrent);
     const inputPath = imageFiles[i];
     const relativePath = path.relative(CONFIG.inputDir, inputPath);
     
@@ -171,42 +180,24 @@ async function compressImages(imageFiles) {
       const inputSize = inputBuffer.length;
       stats.totalInputSize += inputSize;
       
+      // 裁剪图片
+      let processedBuffer = inputBuffer;
+      if (CONFIG.crop.enabled) {
+        processedBuffer = await cropImage(inputBuffer);
+      }
+      
       // 加载图片到 ImagePool
-      const image = imagePool.ingestImage(inputBuffer);
-      
-      // 获取原始图片尺寸
-      await image.decoded;
-      const originalWidth = image.bitmap.width;
-      const originalHeight = image.bitmap.height;
-      
-      console.log(`  原始尺寸: ${originalWidth}x${originalHeight}`);
+      const image = imagePool.ingestImage(processedBuffer);
       
       // 预处理
       const preprocessOpts = {};
       
-      // 裁剪（保留中间338像素宽度）
-      if (CONFIG.cropOptions.enabled && originalWidth > CONFIG.cropOptions.width) {
-        const cropWidth = CONFIG.cropOptions.width;
-        const cropHeight = CONFIG.cropOptions.keepHeight ? originalHeight : CONFIG.preprocessOptions.resize.height;
-        const left = Math.floor((originalWidth - cropWidth) / 2);
-        
-        preprocessOpts.resize = {
-          enabled: true,
-          width: cropWidth,
-          height: cropHeight,
-          method: 'lanczos3',
-          fitMethod: 'stretch',
-          premultiply: true,
-          linearRGB: true,
-        };
-        
-        console.log(`  裁剪: 保留中间${cropWidth}px宽度，偏移${left}px`);
-      } else if (CONFIG.preprocessOptions.resize.enabled) {
-        // 如果不需要裁剪，使用原有的resize设置
+      // 调整大小
+      if (CONFIG.preprocessOptions.resize.enabled) {
         preprocessOpts.resize = CONFIG.preprocessOptions.resize;
       }
       
-      // 缩减调色板（Reduce palette）
+      // 缩减调色板
       if (CONFIG.preprocessOptions.quant.enabled) {
         preprocessOpts.quant = {
           enabled: true,
@@ -249,13 +240,12 @@ async function compressImages(imageFiles) {
       stats.success++;
       
     } catch (error) {
-      console.error(`  ✗ 失败: ${error.message}\n`);
+      console.error(`  ✗ 失败: ${error.message} (${relativePath})\n`);
       stats.failed++;
-    } finally {
-      await imagePool.close();
     }
   }
- 
+  
+  await imagePool.close();
   return stats;
 }
 
@@ -264,16 +254,8 @@ async function compressImages(imageFiles) {
  */
 async function main() {
   console.log('========================================');
-  console.log('    Squoosh 批量图片压缩与裁剪工具');
+  console.log('    图片裁剪与压缩工具（sharp + squoosh）');
   console.log('========================================\n');
-  
-  console.log('配置信息:');
-  console.log(`  输入目录: ${CONFIG.inputDir}`);
-  console.log(`  输出目录: ${CONFIG.outputDir}`);
-  if (CONFIG.cropOptions.enabled) {
-    console.log(`  裁剪设置: 保留中间${CONFIG.cropOptions.width}px宽度`);
-  }
-  console.log('');
   
   // 检查输入目录
   if (!fs.existsSync(CONFIG.inputDir)) {
@@ -295,12 +277,12 @@ async function main() {
   
   console.log(`找到 ${imageFiles.length} 个图片文件\n`);
   
-  // 压缩图片
+  // 处理图片（裁剪 + 压缩）
   const stats = await compressImages(imageFiles);
   
   // 输出统计
   console.log('========================================');
-  console.log('压缩完成！\n');
+  console.log('裁剪与压缩完成！\n');
   console.log(`成功: ${stats.success} 个`);
   console.log(`失败: ${stats.failed} 个`);
   console.log(`总大小: ${formatBytes(stats.totalInputSize)} → ${formatBytes(stats.totalOutputSize)}`);
